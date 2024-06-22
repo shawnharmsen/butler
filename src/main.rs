@@ -1,13 +1,16 @@
-use std::io;
+use reqwest::Error;
+use serde::{Deserialize};
 
-fn main() {
-    let x = 5;
-    println!("The secret number is: {}", x);
-    let x = "six";
-    println!("The secret number is: {}", x);
+#[derive(Deserialize, Debug)]
+struct TimeApiResponse {
+    datetime: String,
+}
 
-    const NUMBERS: [i32; 10] = [100_000, 200_000, 3, 4, 5, 6, 7, 8, 9, 10];
-    for number in NUMBERS {
-        println!("The secret number is: {}", number);
-    }
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let url = "https://worldtimeapi.org/api/timezone/Etc/UTC";
+    let response = reqwest::get(url).await?;
+    let time_api_response: TimeApiResponse = response.json().await?;
+    println!("The current time is: {}", time_api_response.datetime);
+    Ok(())
 }
