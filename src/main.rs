@@ -45,13 +45,17 @@ impl OpenRouterClient {
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are a professional proofreader. Correct any grammatical and spelling errors in the following text and return the corrected version. Do not remove jokes or change the writing style"
+                        "content": "You are a professional proofreader. Correct any grammatical and spelling errors in the following text and return the corrected version. Do not remove jokes or change the writing style. Process the entire text, utilizing the full context window available."
                     },
                     {
                         "role": "user",
                         "content": content
                     }
-                ]
+                ],
+                "max_tokens": 2000000,  // Set to maximum allowed by Gemini Pro 1.5
+                "temperature": 0.1,     // Lower temperature for more deterministic output
+                "top_p": 1,             // Keep this at 1 for proofreading tasks
+                "stream": false         // We want the full response at once
             }))
             .send()
             .await
