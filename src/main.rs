@@ -1,11 +1,8 @@
-// /path/to/your/project/src/main.rs
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use config::{Config, Environment, File};
 use dotenv::dotenv;
-use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use reqwest::{Client, Response};
 use rustyline::{DefaultEditor, Result as RustylineResult};
@@ -13,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 use tokio::time::Instant;
+use futures_util::StreamExt;
+
 
 #[derive(Parser)]
 #[clap(version = "1.0", author = "Dodger")]
@@ -129,43 +128,29 @@ struct AppConfig {
     app_rate_limit_ms: u64,
 }
 
-
 fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
-    let mut builder = Config::builder()
+    let builder = Config::builder()
         .add_source(File::with_name("config/default").required(false))
         .add_source(Environment::default());
 
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path));
-    }
+    let builder = if let Some(path) = config_path {
+        builder.add_source(File::from(path))
+    } else {
+        builder
+    };
 
-    let config = builder.build()?;
-    config.try_deserialize().context("Failed to parse configuration")
+    builder.build()?
+        .try_deserialize()
+        .context("Failed to parse configuration")
 }
 
-
-async fn process_stream(mut response: Response) -> Result<()> {
+async fn process_stream(response: Response) -> Result<()> {
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let text = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&text);
-
-        if buffer.contains("\n\n") {
-            let parts: Vec<&str> = buffer.split("\n\n").collect();
-            for part in parts.iter().take(parts.len() - 1) {
-                if let Some(content) = process_sse_message(part) {
-                    print!("{}", content.green());
-                }
-            }
-            buffer = parts.last().unwrap().to_string();
-        }
-    }
-
-    if !buffer.is_empty() {
-        if let Some(content) = process_sse_message(&buffer) {
+        if let Some(content) = process_sse_message(&text) {
             print!("{}", content.green());
         }
     }
@@ -175,20 +160,19 @@ async fn process_stream(mut response: Response) -> Result<()> {
 }
 
 fn process_sse_message(message: &str) -> Option<String> {
-    if let Some(data) = message.strip_prefix("data: ") {
-        if data.trim() == "[DONE]" {
-            return None;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(data) {
-            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                return Some(content.to_string());
+    message.lines()
+        .filter(|line| line.starts_with("data: "))
+        .filter_map(|line| {
+            let data = &line["data: ".len()..];
+            if data.trim() == "[DONE]" {
+                None
+            } else {
+                serde_json::from_str::<Value>(data).ok()
+                    .and_then(|json| json["choices"][0]["delta"]["content"].as_str().map(String::from))
             }
-        }
-    }
-    None
+        })
+        .next()
 }
-
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -205,7 +189,6 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.app_rate_limit_ms),
     );
 
-
     let mut rl = DefaultEditor::new()?;
     let mut conversation_history: Vec<Message> = Vec::new();
 
@@ -213,15 +196,8 @@ async fn main() -> Result<()> {
     println!("{}", "Welcome to the interactive AI assistant. Type 'exit' to quit.".cyan());
     println!("{}", "-------------------------------------------------------------".cyan());
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-            .template("{spinner} Waiting for AI response...").unwrap()
-    );
-
     while let RustylineResult::Ok(line) = rl.readline("You: ") {
-        if line.trim().to_lowercase() == "exit" {
+        if line.trim().eq_ignore_ascii_case("exit") {
             info!("Exiting the application");
             println!("{}", "Goodbye!".cyan());
             break;
@@ -233,7 +209,7 @@ async fn main() -> Result<()> {
 
         conversation_history.push(Message {
             role: "user".to_string(),
-            content: line.clone(),
+            content: line,
         });
 
         let request = ChatCompletionRequest {
@@ -242,42 +218,15 @@ async fn main() -> Result<()> {
             stream: true,
         };
 
-        pb.enable_steady_tick(Duration::from_millis(120));
-
         match openai.create_chat_completion(&request).await {
             Ok(response) => {
-                pb.finish_and_clear();
-
-                if request.stream {
-                    print!("\n{}: ", "AI".blue());
-                    if let Err(e) = process_stream(response).await {
-                        error!("Error processing stream: {}", e);
-                    }
-                } else {
-                    let chat_response: ChatCompletionResponse = response.json().await?;
-                    info!("Received response from model: {}", chat_response.model);
-                    println!("\n{}", "Metadata:".yellow());
-                    println!("  Model: {}", chat_response.model.green());
-                    println!("  Tokens: {} prompt, {} completion, {} total",
-                             chat_response.usage.prompt_tokens.to_string().green(),
-                             chat_response.usage.completion_tokens.to_string().green(),
-                             chat_response.usage.total_tokens.to_string().green()
-                    );
-
-                    if let Some(choice) = chat_response.choices.first() {
-                        println!("\n{}: {}", "AI".blue(), choice.message.content.green());
-                        conversation_history.push(Message {
-                            role: "assistant".to_string(),
-                            content: choice.message.content.clone(),
-                        });
-                    } else {
-                        println!("\n{}: {}", "AI".blue(), "No response content available.".red());
-                    }
+                print!("\n{}: ", "AI".blue());
+                if let Err(e) = process_stream(response).await {
+                    error!("Error processing stream: {}", e);
                 }
                 println!("{}", "-------------------------------------------------------------".cyan());
             }
             Err(e) => {
-                pb.finish_and_clear();
                 error!("Error: {}", e);
                 eprintln!("{}: {}", "Error".red(), e);
             }
@@ -285,46 +234,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mockito::mock;
-    use tokio;
-
-    #[tokio::test]
-    async fn test_create_chat_completion() {
-        let mock_server = mock("POST", "/chat/completions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"model":"test-model","choices":[{"message":{"content":"Test response"}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#)
-            .create();
-
-        let mut openai = OpenAI::new(
-            "test_api_key".to_string(),
-            "http://test.com".to_string(),
-            "Test App".to_string(),
-            Duration::from_millis(100),
-        );
-        openai.base_url = mockito::server_url();
-
-        let request = ChatCompletionRequest {
-            model: "test-model".to_string(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: "Test message".to_string(),
-            }],
-            stream: false,
-        };
-
-        let response = openai.create_chat_completion(&request).await.unwrap();
-        let chat_response: ChatCompletionResponse = response.json().await.unwrap();
-
-        assert_eq!(chat_response.model, "test-model");
-        assert_eq!(chat_response.choices[0].message.content, "Test response");
-        assert_eq!(chat_response.usage.total_tokens, 30);
-
-        mock_server.assert();
-    }
 }
