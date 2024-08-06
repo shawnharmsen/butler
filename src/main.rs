@@ -4,14 +4,12 @@ use colored::*;
 use config::{Config, Environment, File};
 use dotenv::dotenv;
 use log::{error, info, warn};
-use reqwest::{Client, Response};
+use reqwest::Client;
 use rustyline::{DefaultEditor, Result as RustylineResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 use tokio::time::Instant;
-use futures_util::StreamExt;
-
 
 #[derive(Parser)]
 #[clap(version = "1.0", author = "Dodger")]
@@ -84,7 +82,7 @@ impl OpenAI {
         }
     }
 
-    async fn create_chat_completion(&mut self, request: &ChatCompletionRequest) -> Result<Response> {
+    async fn create_chat_completion(&mut self, request: &ChatCompletionRequest) -> Result<String> {
         self.apply_rate_limit().await;
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -106,7 +104,7 @@ impl OpenAI {
             anyhow::bail!("OpenRouter API error: Status {}, Body: {}", status, error_body);
         }
 
-        Ok(response)
+        response.text().await.context("Failed to get response body")
     }
 
     async fn apply_rate_limit(&mut self) {
@@ -144,13 +142,9 @@ fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
         .context("Failed to parse configuration")
 }
 
-async fn process_stream(response: Response) -> Result<()> {
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let text = String::from_utf8_lossy(&chunk);
-        if let Some(content) = process_sse_message(&text) {
+async fn process_stream(response: String) -> Result<()> {
+    for line in response.lines() {
+        if let Some(content) = process_sse_message(line) {
             print!("{}", content.green());
         }
     }
@@ -160,18 +154,17 @@ async fn process_stream(response: Response) -> Result<()> {
 }
 
 fn process_sse_message(message: &str) -> Option<String> {
-    message.lines()
-        .filter(|line| line.starts_with("data: "))
-        .filter_map(|line| {
-            let data = &line["data: ".len()..];
-            if data.trim() == "[DONE]" {
-                None
-            } else {
-                serde_json::from_str::<Value>(data).ok()
-                    .and_then(|json| json["choices"][0]["delta"]["content"].as_str().map(String::from))
+    if let Some(data) = message.strip_prefix("data: ") {
+        if data.trim() == "[DONE]" {
+            return None;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(data) {
+            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                return Some(content.to_string());
             }
-        })
-        .next()
+        }
+    }
+    None
 }
 
 #[tokio::main]
@@ -219,9 +212,9 @@ async fn main() -> Result<()> {
         };
 
         match openai.create_chat_completion(&request).await {
-            Ok(response) => {
+            Ok(response_text) => {
                 print!("\n{}: ", "AI".blue());
-                if let Err(e) = process_stream(response).await {
+                if let Err(e) = process_stream(response_text).await {
                     error!("Error processing stream: {}", e);
                 }
                 println!("{}", "-------------------------------------------------------------".cyan());
