@@ -9,6 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::env;
 use std::time::Duration;
 
@@ -113,9 +114,6 @@ async fn main() -> Result<()> {
     let site_name = env::var("YOUR_SITE_NAME")
         .context("YOUR_SITE_NAME must be set in .env file")?;
 
-    let openai = OpenAI::new(api_key, site_url, site_name);
-    let mut rl = DefaultEditor::new()?;
-
     println!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
     println!("-------------------------------------------------------------");
 
@@ -143,7 +141,7 @@ async fn main() -> Result<()> {
                 let pb = ProgressBar::new_spinner();
                 pb.set_style(ProgressStyle::default_spinner()
                     .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-                    .template("{spinner} Thinking...").unwrap());
+                    .template("{spinner} Waiting for AI response...").unwrap());
                 pb.enable_steady_tick(Duration::from_millis(120));
 
                 match openai.create_chat_completion(request).await {
@@ -154,22 +152,23 @@ async fn main() -> Result<()> {
 
                         match serde_json::from_str::<ChatCompletionResponse>(&body) {
                             Ok(parsed_response) => {
-                                println!("\nResponse Info:");
-                                println!("  ID: {}", parsed_response.id);
-                                println!("  Model: {}", parsed_response.model);
-                                println!("  Object: {}", parsed_response.object);
-                                println!("  Created: {}", parsed_response.created);
+                                let metadata = json!({
+                                    "id": parsed_response.id,
+                                    "model": parsed_response.model,
+                                    "object": parsed_response.object,
+                                    "created": parsed_response.created,
+                                    "prompt_tokens": parsed_response.usage.prompt_tokens,
+                                    "completion_tokens": parsed_response.usage.completion_tokens,
+                                    "total_tokens": parsed_response.usage.total_tokens
+                                });
+
+                                println!("\nMetadata: {}", serde_json::to_string_pretty(&metadata)?);
 
                                 if let Some(choice) = parsed_response.choices.first() {
                                     println!("\nAI: {}", choice.message.content);
                                 } else {
                                     println!("\nAI: No response content available.");
                                 }
-
-                                println!("\nToken Usage:");
-                                println!("  Prompt tokens:     {}", parsed_response.usage.prompt_tokens);
-                                println!("  Completion tokens: {}", parsed_response.usage.completion_tokens);
-                                println!("  Total tokens:      {}", parsed_response.usage.total_tokens);
                                 println!("-------------------------------------------------------------");
                             }
                             Err(e) => {
