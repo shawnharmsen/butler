@@ -114,6 +114,9 @@ async fn main() -> Result<()> {
     let site_name = env::var("YOUR_SITE_NAME")
         .context("YOUR_SITE_NAME must be set in .env file")?;
 
+    let openai = OpenAI::new(api_key, site_url, site_name);
+    let mut rl = DefaultEditor::new()?;
+
     println!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
     println!("-------------------------------------------------------------");
 
