@@ -103,14 +103,21 @@ struct AppConfig {
 }
 
 fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
-    Config::builder()
-        .add_source(File::with_name("config/default").required(false))
-        .add_source(Environment::default())
-        .add_source(config_path.map(File::from).unwrap_or_else(|| File::from(PathBuf::new())))
-        .build()?
+    let mut builder = Config::builder()
+        .add_source(Environment::with_prefix("APP"));
+
+    if let Some(path) = config_path {
+        builder = builder.add_source(File::from(path));
+    } else {
+        // Try to load a default config file if no path is specified
+        builder = builder.add_source(File::with_name("config").required(false));
+    }
+
+    builder.build()?
         .try_deserialize()
         .context("Failed to parse configuration")
 }
+
 
 async fn process_stream(response: String) -> Result<()> {
     for line in response.lines() {
