@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use dotenv::dotenv;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use reqwest::Client;
 use rustyline::{DefaultEditor, Result as RustylineResult};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{env, time::Duration};
+use std::{env, time::Duration, sync::Arc};
 use tokio::time::Instant;
+use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[clap(version = "1.0", author = "Dodger")]
@@ -30,6 +31,26 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct ChatCompletionResponse {
+    id: String,
+    model: String,
+    usage: Usage,
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Deserialize, Debug)]
+struct Choice {
+    message: Message,
 }
 
 struct OpenAI {
@@ -55,7 +76,7 @@ impl OpenAI {
         }
     }
 
-    async fn create_chat_completion(&mut self, request: &ChatCompletionRequest) -> Result<String> {
+    async fn create_chat_completion(&mut self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         self.apply_rate_limit().await;
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -77,7 +98,7 @@ impl OpenAI {
             anyhow::bail!("OpenRouter API error: Status {}, Body: {}", status, error_body);
         }
 
-        response.text().await.context("Failed to get response body")
+        response.json::<ChatCompletionResponse>().await.context("Failed to parse response")
     }
 
     async fn apply_rate_limit(&mut self) {
@@ -105,27 +126,6 @@ fn load_config() -> Result<(String, String, String, u64)> {
     ))
 }
 
-async fn process_stream(response: String) -> Result<()> {
-    for line in response.lines() {
-        if let Some(content) = process_sse_message(line) {
-            print!("{}", content.green());
-        }
-    }
-    println!();
-    Ok(())
-}
-
-fn process_sse_message(message: &str) -> Option<String> {
-    message.strip_prefix("data: ").and_then(|data| {
-        if data.trim() == "[DONE]" {
-            None
-        } else {
-            serde_json::from_str::<Value>(data).ok()
-                .and_then(|json| json["choices"][0]["delta"]["content"].as_str().map(String::from))
-        }
-    })
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -134,19 +134,26 @@ async fn main() -> Result<()> {
 
     let opts: Opts = Opts::parse();
 
-    let mut openai = OpenAI::new(
+    let openai = Arc::new(Mutex::new(OpenAI::new(
         api_key,
         site_url,
         site_name,
         Duration::from_millis(rate_limit_ms),
-    );
+    )));
 
     let mut rl = DefaultEditor::new()?;
-    let mut conversation_history = Vec::new();
+    let conversation_history = Arc::new(Mutex::new(Vec::new()));
 
     info!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
     println!("{}", "Welcome to the interactive AI assistant. Type 'exit' to quit.".cyan());
     println!("{}", "-------------------------------------------------------------".cyan());
+
+    let pb = Arc::new(Mutex::new(ProgressBar::new_spinner()));
+    pb.lock().await.set_style(ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template("{spinner} Processing...").unwrap());
+
+    let processing = Arc::new(Mutex::new(false));
 
     while let RustylineResult::Ok(line) = rl.readline("You: ") {
         if line.trim().eq_ignore_ascii_case("exit") {
@@ -155,34 +162,69 @@ async fn main() -> Result<()> {
             break;
         }
 
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut is_processing = processing.lock().await;
+        if *is_processing {
+            println!("Still processing previous request. Please wait.");
+            continue;
+        }
+        *is_processing = true;
+        drop(is_processing);
+
         if let Err(err) = rl.add_history_entry(&line) {
             warn!("Failed to add history entry: {}", err);
         }
 
-        conversation_history.push(Message {
+        conversation_history.lock().await.push(Message {
             role: "user".to_string(),
             content: line,
         });
 
         let request = ChatCompletionRequest {
             model: opts.model.clone(),
-            messages: conversation_history.clone(),
-            stream: true,
+            messages: conversation_history.lock().await.clone(),
+            stream: false,
         };
 
-        match openai.create_chat_completion(&request).await {
-            Ok(response_text) => {
-                print!("\n{}: ", "AI".blue());
-                if let Err(e) = process_stream(response_text).await {
-                    error!("Error processing stream: {}", e);
+        let pb_clone = Arc::clone(&pb);
+        let processing_clone = Arc::clone(&processing);
+        let openai_clone = Arc::clone(&openai);
+        let conversation_history_clone = Arc::clone(&conversation_history);
+
+        tokio::spawn(async move {
+            pb_clone.lock().await.enable_steady_tick(Duration::from_millis(100));
+
+            match openai_clone.lock().await.create_chat_completion(&request).await {
+                Ok(response) => {
+                    pb_clone.lock().await.finish_and_clear();
+                    print!("\n{}: ", "AI".blue());
+                    if let Some(choice) = response.choices.first() {
+                        println!("{}", choice.message.content.green());
+                    }
+                    println!("\n{}", "Metadata:".yellow());
+                    println!("Model: {}", response.model);
+                    println!("Tokens: {} prompt, {} completion, {} total",
+                             response.usage.prompt_tokens,
+                             response.usage.completion_tokens,
+                             response.usage.total_tokens);
+                    println!("Response ID: {}", response.id);
+                    println!("{}", "-------------------------------------------------------------".cyan());
+
+                    conversation_history_clone.lock().await.push(response.choices[0].message.clone());
                 }
-                println!("{}", "-------------------------------------------------------------".cyan());
+                Err(e) => {
+                    pb_clone.lock().await.finish_and_clear();
+                    error!("Error: {}", e);
+                    eprintln!("{}: {}", "Error".red(), e);
+                }
             }
-            Err(e) => {
-                error!("Error: {}", e);
-                eprintln!("{}: {}", "Error".red(), e);
-            }
-        }
+
+            let mut is_processing = processing_clone.lock().await;
+            *is_processing = false;
+        });
     }
 
     Ok(())
