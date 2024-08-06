@@ -34,12 +34,22 @@ struct ChatCompletionRequest {
 
 #[derive(Deserialize, Debug)]
 struct ChatCompletionResponse {
+    id: String,
+    model: String,
     choices: Vec<Choice>,
+    usage: Usage,
 }
 
 #[derive(Deserialize, Debug)]
 struct Choice {
     message: Message,
+}
+
+#[derive(Deserialize, Debug)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 struct OpenAI {
@@ -84,13 +94,24 @@ fn load_config() -> Result<(String, String, String)> {
 async fn process_prompt(ai: &OpenAI, prompt: String, model: String) -> Result<()> {
     let request = ChatCompletionRequest {
         model,
-        messages: vec![Message { role: "user".to_string(), content: prompt }],
+        messages: vec![Message { role: "user".to_string(), content: prompt.clone() }],
     };
 
     match ai.create_chat_completion(&request).await {
         Ok(response) => {
             if let Some(choice) = response.choices.first() {
-                println!("{}", choice.message.content.green());
+                println!("{}", "Prompt:".yellow().bold());
+                println!("{}\n", prompt.yellow());
+                println!("{}", "Response:".green().bold());
+                println!("{}\n", choice.message.content.green());
+                println!("{}", "Metadata:".cyan().bold());
+                println!("Model: {}", response.model.cyan());
+                println!("Tokens: {} prompt, {} completion, {} total",
+                         response.usage.prompt_tokens.to_string().cyan(),
+                         response.usage.completion_tokens.to_string().cyan(),
+                         response.usage.total_tokens.to_string().cyan());
+                println!("Response ID: {}", response.id.cyan());
+                println!("{}", "-------------------------------------------------------------".cyan());
                 info!("AI response received successfully.");
             }
             Ok(())
@@ -119,6 +140,9 @@ async fn main() -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(opts.max_concurrent));
 
+    println!("{}", "Starting AI processing...".blue().bold());
+    println!("{}", "-------------------------------------------------------------".blue());
+
     let tasks: Vec<_> = opts.prompts.into_iter().map(|prompt| {
         let ai = ai.clone();
         let semaphore = semaphore.clone();
@@ -133,5 +157,6 @@ async fn main() -> Result<()> {
         task.await??;
     }
 
+    println!("{}", "All prompts processed successfully.".blue().bold());
     Ok(())
 }
