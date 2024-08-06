@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
-use config::{Config, Environment, File};
 use dotenv::dotenv;
 use log::{error, info, warn};
 use reqwest::Client;
 use rustyline::{DefaultEditor, Result as RustylineResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::PathBuf, time::Duration};
+use std::{env, time::Duration};
 use tokio::time::Instant;
 
 #[derive(Parser)]
@@ -18,8 +17,6 @@ struct Opts {
     prompt: Option<String>,
     #[clap(short, long, default_value = "anthropic/claude-3.5-sonnet")]
     model: String,
-    #[clap(short, long)]
-    config: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,30 +91,19 @@ impl OpenAI {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct AppConfig {
-    openrouter_api_key: String,
-    your_site_url: String,
-    your_site_name: String,
-    app_rate_limit_ms: u64,
+fn load_config() -> Result<(String, String, String, u64)> {
+    dotenv().ok();
+
+    Ok((
+        env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY must be set in .env file")?,
+        env::var("YOUR_SITE_URL").context("YOUR_SITE_URL must be set in .env file")?,
+        env::var("YOUR_SITE_NAME").context("YOUR_SITE_NAME must be set in .env file")?,
+        env::var("APP_RATE_LIMIT_MS")
+            .context("APP_RATE_LIMIT_MS must be set in .env file")?
+            .parse()
+            .context("APP_RATE_LIMIT_MS must be a valid integer")?,
+    ))
 }
-
-fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
-    let mut builder = Config::builder()
-        .add_source(Environment::with_prefix("APP"));
-
-    if let Some(path) = config_path {
-        builder = builder.add_source(File::from(path));
-    } else {
-        // Try to load a default config file if no path is specified
-        builder = builder.add_source(File::with_name("config").required(false));
-    }
-
-    builder.build()?
-        .try_deserialize()
-        .context("Failed to parse configuration")
-}
-
 
 async fn process_stream(response: String) -> Result<()> {
     for line in response.lines() {
@@ -142,17 +128,17 @@ fn process_sse_message(message: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
     env_logger::init();
 
+    let (api_key, site_url, site_name, rate_limit_ms) = load_config()?;
+
     let opts: Opts = Opts::parse();
-    let config = load_config(opts.config)?;
 
     let mut openai = OpenAI::new(
-        config.openrouter_api_key,
-        config.your_site_url,
-        config.your_site_name,
-        Duration::from_millis(config.app_rate_limit_ms),
+        api_key,
+        site_url,
+        site_name,
+        Duration::from_millis(rate_limit_ms),
     );
 
     let mut rl = DefaultEditor::new()?;
