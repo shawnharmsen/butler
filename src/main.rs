@@ -10,6 +10,7 @@ use log::{error, info, warn};
 use reqwest::{Client, Response};
 use rustyline::{DefaultEditor, Result as RustylineResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 use tokio::time::Instant;
 
@@ -143,13 +144,50 @@ fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
 }
 
 
-async fn process_stream(response: Response) -> Result<()> {
-    let bytes = response.bytes().await?;
-    let text = String::from_utf8_lossy(&bytes);
-    print!("{}", text.green());
+async fn process_stream(mut response: Response) -> Result<()> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&text);
+
+        if buffer.contains("\n\n") {
+            let parts: Vec<&str> = buffer.split("\n\n").collect();
+            for part in parts.iter().take(parts.len() - 1) {
+                if let Some(content) = process_sse_message(part) {
+                    print!("{}", content.green());
+                }
+            }
+            buffer = parts.last().unwrap().to_string();
+        }
+    }
+
+    if !buffer.is_empty() {
+        if let Some(content) = process_sse_message(&buffer) {
+            print!("{}", content.green());
+        }
+    }
+
     println!();
     Ok(())
 }
+
+fn process_sse_message(message: &str) -> Option<String> {
+    if let Some(data) = message.strip_prefix("data: ") {
+        if data.trim() == "[DONE]" {
+            return None;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(data) {
+            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                return Some(content.to_string());
+            }
+        }
+    }
+    None
+}
+
 
 
 #[tokio::main]
@@ -211,6 +249,7 @@ async fn main() -> Result<()> {
                 pb.finish_and_clear();
 
                 if request.stream {
+                    print!("\n{}: ", "AI".blue());
                     if let Err(e) = process_stream(response).await {
                         error!("Error processing stream: {}", e);
                     }
