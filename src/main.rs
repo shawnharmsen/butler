@@ -1,10 +1,13 @@
 // src/main.rs
+use indicatif::{ProgressBar, ProgressStyle};
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use dotenv::dotenv;
 use log::{error, info};
 use reqwest::Client;
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, Result as RustylineResult};
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
 use tokio::sync::Semaphore;
@@ -123,6 +126,67 @@ async fn process_prompt(ai: &OpenAI, prompt: String, model: String) -> Result<()
     }
 }
 
+async fn repl(ai: Arc<OpenAI>, model: String, max_concurrent: usize) -> Result<()> {
+    let mut rl = DefaultEditor::new()?;
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+    println!("{}", "Interactive AI Assistant (type 'exit' to quit)".blue().bold());
+    println!("{}", "-------------------------------------------------------------".blue());
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template("{spinner} Processing...").unwrap());
+
+    loop {
+        let readline = rl.readline("You: ");
+        match readline {
+            Ok(line) => {
+                if line.trim().eq_ignore_ascii_case("exit") {
+                    break;
+                }
+                let _ = rl.add_history_entry(line.as_str());
+                let ai = ai.clone();
+                let semaphore = semaphore.clone();
+                let model = model.clone();
+
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+                match tokio::spawn(async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+                    process_prompt(&ai, line, model).await
+                }).await {
+                    Ok(result) => {
+                        pb.finish_and_clear();
+                        if let Err(e) = result {
+                            eprintln!("Error: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        pb.finish_and_clear();
+                        eprintln!("Task panicked: {}", e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("CTRL-C");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break;
+            }
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
+
+    println!("{}", "Exiting AI Assistant.".blue().bold());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -138,25 +202,30 @@ async fn main() -> Result<()> {
         site_name,
     });
 
-    let semaphore = Arc::new(Semaphore::new(opts.max_concurrent));
+    if opts.prompts.is_empty() {
+        repl(ai, opts.model, opts.max_concurrent).await?;
+    } else {
+        let semaphore = Arc::new(Semaphore::new(opts.max_concurrent));
 
-    println!("{}", "Starting AI processing...".blue().bold());
-    println!("{}", "-------------------------------------------------------------".blue());
+        println!("{}", "Starting AI processing...".blue().bold());
+        println!("{}", "-------------------------------------------------------------".blue());
 
-    let tasks: Vec<_> = opts.prompts.into_iter().map(|prompt| {
-        let ai = ai.clone();
-        let semaphore = semaphore.clone();
-        let model = opts.model.clone();
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            process_prompt(&ai, prompt, model).await
-        })
-    }).collect();
+        let tasks: Vec<_> = opts.prompts.into_iter().map(|prompt| {
+            let ai = ai.clone();
+            let semaphore = semaphore.clone();
+            let model = opts.model.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                process_prompt(&ai, prompt, model).await
+            })
+        }).collect();
 
-    for task in tasks {
-        task.await??;
+        for task in tasks {
+            task.await??;
+        }
+
+        println!("{}", "All prompts processed successfully.".blue().bold());
     }
 
-    println!("{}", "All prompts processed successfully.".blue().bold());
     Ok(())
 }
