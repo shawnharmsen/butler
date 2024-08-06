@@ -35,30 +35,6 @@ struct ChatCompletionRequest {
     stream: bool,
 }
 
-#[derive(Deserialize, Debug)]
-struct ChatCompletionResponse {
-    model: String,
-    choices: Vec<Choice>,
-    usage: Usage,
-}
-
-#[derive(Deserialize, Debug)]
-struct Choice {
-    message: AssistantMessage,
-}
-
-#[derive(Deserialize, Debug)]
-struct AssistantMessage {
-    content: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
-
 struct OpenAI {
     client: Client,
     api_key: String,
@@ -127,17 +103,11 @@ struct AppConfig {
 }
 
 fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
-    let builder = Config::builder()
+    Config::builder()
         .add_source(File::with_name("config/default").required(false))
-        .add_source(Environment::default());
-
-    let builder = if let Some(path) = config_path {
-        builder.add_source(File::from(path))
-    } else {
-        builder
-    };
-
-    builder.build()?
+        .add_source(Environment::default())
+        .add_source(config_path.map(File::from).unwrap_or_else(|| File::from(PathBuf::new())))
+        .build()?
         .try_deserialize()
         .context("Failed to parse configuration")
 }
@@ -148,23 +118,19 @@ async fn process_stream(response: String) -> Result<()> {
             print!("{}", content.green());
         }
     }
-
     println!();
     Ok(())
 }
 
 fn process_sse_message(message: &str) -> Option<String> {
-    if let Some(data) = message.strip_prefix("data: ") {
+    message.strip_prefix("data: ").and_then(|data| {
         if data.trim() == "[DONE]" {
-            return None;
+            None
+        } else {
+            serde_json::from_str::<Value>(data).ok()
+                .and_then(|json| json["choices"][0]["delta"]["content"].as_str().map(String::from))
         }
-        if let Ok(json) = serde_json::from_str::<Value>(data) {
-            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                return Some(content.to_string());
-            }
-        }
-    }
-    None
+    })
 }
 
 #[tokio::main]
@@ -183,7 +149,7 @@ async fn main() -> Result<()> {
     );
 
     let mut rl = DefaultEditor::new()?;
-    let mut conversation_history: Vec<Message> = Vec::new();
+    let mut conversation_history = Vec::new();
 
     info!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
     println!("{}", "Welcome to the interactive AI assistant. Type 'exit' to quit.".cyan());
