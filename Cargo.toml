@@ -18,4 +18,8 @@ rustyline = "14.0.0"
 futures-util = "0.3.30"
 indicatif = "0.17.8"
 bytes = "1.6.0"
+colored = "2.1.0"
+config = "0.14.0"
+log = "0.4.21"
+env_logger = "0.11.5"
 # Debug
