@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{stdout, Write};
 use std::time::Duration;
-use futures_util::StreamExt;
 
 
 #[derive(Parser)]
@@ -41,13 +40,14 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize, Debug)]
 struct Choice {
-    delta: Delta,
+    message: AssistantMessage,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-struct Delta {
-    content: Option<String>,
+struct AssistantMessage {
+    role: String,
+    content: String,
 }
 
 struct OpenAI {
@@ -139,34 +139,25 @@ async fn main() -> Result<()> {
                 match openai.create_chat_completion(request).await {
                     Ok(response) => {
                         pb.finish_and_clear();
-                        print!("AI: ");
-                        stdout().flush()?;
 
-                        let mut stream = response.bytes_stream();
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(content) => {
-                                    if let Ok(text) = String::from_utf8(content.to_vec()) {
-                                        if let Ok(response) = serde_json::from_str::<ChatCompletionResponse>(&text) {
-                                            if let Some(choice) = response.choices.first() {
-                                                if let Some(content) = &choice.delta.content {
-                                                    print!("{}", content);
-                                                    stdout().flush()?;
-                                                }
-                                                if choice.finish_reason.is_some() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("\nError: {}", e);
-                                    break;
+                        let body = response.text().await?;
+
+                        // Debug: Print full response
+                        eprintln!("Full response: {}", body);
+
+                        match serde_json::from_str::<ChatCompletionResponse>(&body) {
+                            Ok(parsed_response) => {
+                                if let Some(choice) = parsed_response.choices.first() {
+                                    println!("AI: {}", choice.message.content);
+                                } else {
+                                    println!("AI: No response content available.");
                                 }
                             }
+                            Err(e) => {
+                                eprintln!("Failed to parse JSON: {}", e);
+                                println!("AI: Sorry, I encountered an error processing the response.");
+                            }
                         }
-                        println!("\n");
                     }
                     Err(e) => {
                         pb.finish_and_clear();
