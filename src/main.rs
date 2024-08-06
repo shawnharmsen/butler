@@ -10,7 +10,6 @@ use reqwest::Client;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::io::{stdout, Write};
 use std::time::Duration;
 
 
@@ -35,19 +34,29 @@ struct ChatCompletionRequest {
 
 #[derive(Deserialize, Debug)]
 struct ChatCompletionResponse {
+    id: String,
+    model: String,
+    object: String,
+    created: u64,
     choices: Vec<Choice>,
+    usage: Usage,
 }
 
 #[derive(Deserialize, Debug)]
 struct Choice {
     message: AssistantMessage,
-    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct AssistantMessage {
-    role: String,
     content: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 struct OpenAI {
@@ -108,9 +117,10 @@ async fn main() -> Result<()> {
     let mut rl = DefaultEditor::new()?;
 
     println!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
+    println!("-------------------------------------------------------------");
 
     loop {
-        let readline = rl.readline("Question: ");
+        let readline = rl.readline("You: ");
         match readline {
             Ok(line) => {
                 if line.trim().to_lowercase() == "exit" {
@@ -142,20 +152,29 @@ async fn main() -> Result<()> {
 
                         let body = response.text().await?;
 
-                        // Debug: Print full response
-                        eprintln!("Full response: {}", body);
-
                         match serde_json::from_str::<ChatCompletionResponse>(&body) {
                             Ok(parsed_response) => {
+                                println!("\nResponse Info:");
+                                println!("  ID: {}", parsed_response.id);
+                                println!("  Model: {}", parsed_response.model);
+                                println!("  Object: {}", parsed_response.object);
+                                println!("  Created: {}", parsed_response.created);
+
                                 if let Some(choice) = parsed_response.choices.first() {
-                                    println!("AI: {}", choice.message.content);
+                                    println!("\nAI: {}", choice.message.content);
                                 } else {
-                                    println!("AI: No response content available.");
+                                    println!("\nAI: No response content available.");
                                 }
+
+                                println!("\nToken Usage:");
+                                println!("  Prompt tokens:     {}", parsed_response.usage.prompt_tokens);
+                                println!("  Completion tokens: {}", parsed_response.usage.completion_tokens);
+                                println!("  Total tokens:      {}", parsed_response.usage.total_tokens);
+                                println!("-------------------------------------------------------------");
                             }
                             Err(e) => {
                                 eprintln!("Failed to parse JSON: {}", e);
-                                println!("AI: Sorry, I encountered an error processing the response.");
+                                println!("\nAI: Sorry, I encountered an error processing the response.");
                             }
                         }
                     }
