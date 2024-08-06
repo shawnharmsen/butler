@@ -1,102 +1,195 @@
 #![allow(non_snake_case)]
 // /path/to/your/project/src/main.rs
 
-use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use serde_json::json;
-use std::env;
-use std::fs;
-use std::path::Path;
+// src/main.rs
 use dotenv::dotenv;
+use anyhow::{Context, Result};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
+use rustyline::DefaultEditor;
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::io::{stdout, Write};
+use std::time::Duration;
+use futures_util::StreamExt;
 
-const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-struct OpenRouterClient {
-    client: reqwest::Client,
-    api_key: String,
+#[derive(Parser)]
+#[clap(version = "1.0", author = "Dodger")]
+struct Opts {
+    #[clap(short, long)]
+    prompt: String,
 }
 
-impl OpenRouterClient {
-    fn new(api_key: String) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "HTTP-Referer",
-            HeaderValue::from_static("https://asdf.asdf"),
-        );
-        headers.insert("X-Title", HeaderValue::from_static("asdf"));
+#[derive(Serialize, Deserialize, Debug)]
+struct Message {
+    role: String,
+    content: String,
+}
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .context("Failed to create HTTP client")?;
+#[derive(Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<Message>,
+}
 
-        Ok(Self { client, api_key })
+#[derive(Deserialize, Debug)]
+struct ChatCompletionResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Choice {
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Delta {
+    content: Option<String>,
+}
+
+struct OpenAI {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    site_url: String,
+    site_name: String,
+}
+
+impl OpenAI {
+    fn new(api_key: String, site_url: String, site_name: String) -> Self {
+        Self {
+            client: Client::new(),
+            api_key,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            site_url,
+            site_name,
+        }
     }
 
-    async fn proofread(&self, content: &str) -> Result<String> {
-        let auth_header = format!("Bearer {}", self.api_key);
-        let response = self
-            .client
-            .post(API_URL)
-            .header(AUTHORIZATION, auth_header)
-            .json(&json!({
-                "model": "google/gemini-pro-1.5",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a professional proofreader. Correct any grammatical and spelling errors in the following text and return the corrected version. Do not remove jokes or change the writing style. Process the entire text, utilizing the full context window available."
-                    },
-                    {
-                        "role": "user",
-                        "content": content
-                    }
-                ],
-                "max_tokens": 2000000,  // Set to maximum allowed by Gemini Pro 1.5
-                "temperature": 0.1,     // Lower temperature for more deterministic output
-                "top_p": 1,             // Keep this at 1 for proofreading tasks
-                "stream": false         // We want the full response at once
-            }))
+    async fn create_chat_completion(&self, request: ChatCompletionRequest) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let response = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", &self.site_url)
+            .header("X-Title", &self.site_name)
+            .header("Accept", "text/event-stream")
+            .json(&request)
             .send()
             .await
-            .context("Failed to send request to OpenRouter API")?;
+            .context("Failed to send request to OpenRouter")?;
 
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse API response")?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.context("Failed to get error response body")?;
+            anyhow::bail!("OpenRouter API error: Status {}, Body: {}", status, error_body);
+        }
 
-        result["choices"][0]["message"]["content"]
-            .as_str()
-            .map(String::from)
-            .context("Failed to extract content from API response")
+        Ok(response)
     }
-}
-
-fn read_file(path: &Path) -> Result<String> {
-    fs::read_to_string(path).context("Failed to read input file")
-}
-
-fn write_file(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content).context("Failed to write output file")
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file
-    dotenv().context("Failed to load .env file")?;
+    dotenv().ok();
 
-    let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set in .env file")?;
-    let input_path = Path::new("input.txt");
-    let output_path = Path::new("output.txt");
+    let api_key = env::var("OPENROUTER_API_KEY")
+        .context("OPENROUTER_API_KEY must be set in .env file")?;
+    let site_url = env::var("YOUR_SITE_URL")
+        .context("YOUR_SITE_URL must be set in .env file")?;
+    let site_name = env::var("YOUR_SITE_NAME")
+        .context("YOUR_SITE_NAME must be set in .env file")?;
 
-    let client = OpenRouterClient::new(api_key)?;
+    let openai = OpenAI::new(api_key, site_url, site_name);
+    let mut rl = DefaultEditor::new()?;
 
-    let input_text = read_file(input_path)?;
-    let proofread_text = client.proofread(&input_text).await?;
-    write_file(output_path, &proofread_text)?;
+    println!("Welcome to the interactive AI assistant. Type 'exit' to quit.");
 
-    println!("Proofreading complete. Result saved to {:?}", output_path);
+    loop {
+        let readline = rl.readline("Question: ");
+        match readline {
+            Ok(line) => {
+                if line.trim().to_lowercase() == "exit" {
+                    println!("Goodbye!");
+                    break;
+                }
+
+                if let Err(err) = rl.add_history_entry(line.as_str()) {
+                    eprintln!("Warning: Failed to add history entry: {}", err);
+                }
+
+                let request = ChatCompletionRequest {
+                    model: "anthropic/claude-3.5-sonnet".to_string(),
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: line,
+                    }],
+                };
+
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(ProgressStyle::default_spinner()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+                    .template("{spinner} Thinking...").unwrap());
+                pb.enable_steady_tick(Duration::from_millis(120));
+
+                match openai.create_chat_completion(request).await {
+                    Ok(response) => {
+                        pb.finish_and_clear();
+                        print!("AI: ");
+                        stdout().flush()?;
+
+                        let mut stream = response.bytes_stream();
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(content) => {
+                                    if let Ok(text) = String::from_utf8(content.to_vec()) {
+                                        if let Ok(response) = serde_json::from_str::<ChatCompletionResponse>(&text) {
+                                            if let Some(choice) = response.choices.first() {
+                                                if let Some(content) = &choice.delta.content {
+                                                    print!("{}", content);
+                                                    stdout().flush()?;
+                                                }
+                                                if choice.finish_reason.is_some() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("\nError: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        println!("\n");
+                    }
+                    Err(e) => {
+                        pb.finish_and_clear();
+                        println!("Error: {}", e);
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("CTRL-C");
+                break;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break;
+            }
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
+
+
